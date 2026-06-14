@@ -1,0 +1,922 @@
+project tradesdb {
+  database_type: 'postgresql'
+  note: '''
+  # Algorithmic Trading Database (`tradesdb`)
+
+  Operational store for a **broker-agnostic algorithmic trading system**, hosted on
+  **PostgreSQL v17.10** on the same cluster as `macrodb` and `stocksdb`. Owns the
+  *trading-private* state of the platform — strategies, capital allocation, risk
+  rules, generated signals, the order/execution lifecycle, position & P&L facts,
+  circuit-breaker events, and an immutable audit trail.
+
+  Designed to back the `growthio/algotraders` Python library and to support the full
+  automation spectrum: signal-only (A) → human-approved (B) → fully automated (C),
+  with a parallel paper-trading mode that shares the same code path as live.
+
+  **Reference master data is never owned here** — securities, exchanges, symbol
+  mappings, derivative contracts and currencies are *subscribed* read-only from
+  `macrodb` / `stocksdb` (see Logical Replication below). Trading facts reference
+  that data through ordinary foreign keys into the local subscription tables, while
+  the subscription tables themselves carry **no incoming foreign keys** (dropped on
+  the subscriber side to avoid apply-order failures).
+
+  ## Schema Layout
+
+  | schema    | purpose                                                                    |
+  |:----------|:---------------------------------------------------------------------------|
+  | `public`  | Bootstrap reference data — broker integrations master.                     |
+  | `common`  | Trading masters (account, strategy, risk) + macrodb/stocksdb subscriptions.|
+  | `private` | Transactional facts (signals, orders, fills, positions, P&L) + audit log.  |
+  | `dev`     | Developer/auditor user-defined functions only — *no tables*.               |
+
+  ## Table Naming Convention
+
+  - `*_mw` → **M**aster, **W**orld scope (slowly-changing reference / config data).
+  - `*_tx` → **T**ransactional fact table (append-mostly rows).
+
+  ## Logical Replication (Subscriptions)
+
+  All reference tables in `common` are read-only and populated via PostgreSQL
+  logical replication subscriptions. `INSERT / UPDATE / DELETE` are revoked from
+  `PUBLIC` on every subscribed table, and all incoming foreign-key constraints are
+  omitted on the subscriber side. Each subscribed table keeps its primary key so it
+  can serve as the replica identity required for `UPDATE` / `DELETE` apply.
+
+  | Subscription                    | Source DB  | Source Publication            | Tables                                                          |
+  |:--------------------------------|:-----------|:------------------------------|:----------------------------------------------------------------|
+  | `macrodb_currency_reference`    | `macrodb`  | `macrodb_currency_table`      | `common.currency_mw`                                            |
+  | `stocksdb_securities_reference` | `stocksdb` | `stocksdb_securities_table`   | `common.securities_mw`, `common.securities_exchange_symbol_mw`  |
+  | `stocksdb_exchange_reference`   | `stocksdb` | `stocksdb_exchange_table`     | `common.stock_exchange_mw`                                      |
+  | `stocksdb_derivative_reference` | `stocksdb` | `stocksdb_derivative_table`   | `common.derivative_contract_mw`                                 |
+
+  > **Cross-repo dependency:** the three `stocksdb_*` publications above must be
+  > created on `stocksdb` (it currently publishes nothing). `macrodb_currency_table`
+  > already exists. See [publication.conf.sql](database/publication.conf.sql).
+
+  ## Custom Enum Types (PostgreSQL — Not Representable in DBML Free Tier)
+
+  | Type                          | Values                                                                                              | Used in                                   |
+  |:------------------------------|:----------------------------------------------------------------------------------------------------|:------------------------------------------|
+  | `common.timeframe_value`      | `1m, 3m, 5m, 15m, 1h, 1D, 1M, 1Y` (8)                                                                | `common.strategy_mw.timeframe`            |
+  | `common.strategy_stage`       | `A, B, C, RETIRED` (4)                                                                               | `common.strategy_mw.strategy_stage`       |
+  | `common.signal_source`        | `STRATEGY, TRADINGVIEW, MANUAL` (3)                                                                  | `*.signal_source`                         |
+  | `common.allocation_policy`    | `STATIC_PCT, DYNAMIC_FREEFLOAT` (2)                                                                  | `common.strategy_allocation_mw`           |
+  | `common.risk_scope`           | `ACCOUNT, STRATEGY, PORTFOLIO` (3)                                                                   | `common.risk_rule_mw`, circuit events     |
+  | `common.risk_rule_type`       | `PER_TRADE_SL, POSITION_SIZE, DAILY_MAX_LOSS, MAX_POSITIONS, SINGLE_ISIN_EXPOSURE, SECTOR_CONC` (6)  | `common.risk_rule_mw.risk_rule_type`      |
+  | `private.instrument_kind`     | `EQUITY, DERIVATIVE` (2)                                                                             | signals / orders / positions / universe   |
+  | `private.signal_action`       | `BUY, SELL, EXIT_LONG, EXIT_SHORT` (4)                                                               | `private.signal_tx.signal_action`         |
+  | `private.signal_status`       | `PENDING, VALIDATED, APPROVED, REJECTED, EXPIRED` (5)                                                | `private.signal_tx.signal_status`         |
+  | `private.order_side`          | `BUY, SELL` (2)                                                                                      | `private.order_tx.order_side`             |
+  | `private.order_type`          | `MARKET, LIMIT, SL, SL_M` (4)                                                                        | `private.order_tx.order_type`             |
+  | `private.order_variety`       | `REGULAR, BRACKET, COVER, AMO` (4)                                                                   | `private.order_tx.order_variety`          |
+  | `private.product_type`        | `CNC, INTRADAY, MARGIN, NORMAL` (4)                                                                  | `private.order_tx.product_type`           |
+  | `private.order_status`        | `PENDING_APPROVAL, APPROVED, REJECTED, SUBMITTED, OPEN, PARTIALLY_FILLED, FILLED, CANCELLED, EXPIRED, FAILED` (10) | `private.order_tx.order_status` |
+  | `private.approval_source`     | `DASHBOARD, TELEGRAM, AUTO` (3)                                                                      | `private.order_tx.approval_source`        |
+  | `private.execution_mode`      | `LIVE, PAPER, BACKTEST` (3)                                                                          | every `_tx` table                         |
+  | `private.actor_type`          | `SYSTEM, STRATEGY, USER, BROKER` (4)                                                                 | `private.audit_log_tx.actor_type`         |
+
+  Enum columns are represented as `varchar` in this diagram.
+
+  ## Execution Modes
+
+  Every transactional fact carries `execution_mode` (`LIVE` / `PAPER` / `BACKTEST`).
+  The same strategy class runs in all three modes against the same tables; promotion
+  through stages A → B → C is governed purely by `common.strategy_mw.strategy_stage`,
+  never by a code fork.
+
+  ## CI/CD
+
+  Managed through **Project Archon**, mirroring the migration & deploy pattern used
+  by `macrodb` and `stocksdb`. Schema migrations run via Alembic ahead of each
+  rolling restart on the host.
+  '''
+}
+
+
+// ============================================================================
+// public schema — operational bootstrap
+// ============================================================================
+
+table public.broker_mw {
+  broker_code            char(5)      [pk] // pk_broker_code
+  broker_name            varchar(64)  [not null, unique] // uq_broker_name
+  broker_desc            varchar(256) [not null]
+  broker_uri             varchar(128) [not null, unique] // uq_broker_uri
+  supports_websocket     boolean      [not null, default: false]
+  supports_bracket_order boolean      [not null, default: false]
+  is_active              boolean      [not null, default: true]
+
+  note: '''
+  ## Broker Master (`mw` = Master-World)
+
+  Master list of broker integrations the platform can authenticate and trade
+  through. Acts as the dimensional lookup behind every order placed and every
+  account opened. Capability flags (`supports_websocket`, `supports_bracket_order`)
+  let the order manager and ticker service degrade gracefully per broker.
+
+  > **Note:** `broker_uri` must store a bare base URL only — never a query string,
+  > token, or embedded credential. Live secrets (API keys, TOTP seeds) are held in
+  > the host secret store, **never** in this database.
+
+  ### Referenced By
+
+  - **`common.account_mw`** — `fk_account_broker_code`
+  - **`private.order_tx`** — `fk_order_broker_code`
+
+  ### Seeded Values
+
+  `FYERS` (Fyers API v3), `ZRDHA` (Zerodha Kite — future), `PAPER` (in-house paper
+  trading simulator) — see `database/schema/public/seed/broker.sql`.
+  '''
+}
+
+
+// ============================================================================
+// common schema — subscribed reference data (read-only · bare · no incoming FKs)
+// ============================================================================
+
+table common.currency_mw {
+  currency_code     char(3)     [pk] // pk_currency_code
+  currency_name     varchar(64) [not null, unique] // uq_currency_name
+  currency_symbol   varchar(16) [unique] // uq_currency_symbol
+  currency_type     char(1)     [not null]
+  currency_subtype  char(1)
+  n_decimals        integer     [not null, default: 2]
+  minor_unit_name   varchar(32)
+  minor_unit_symbol varchar(16)
+  minor_unit_factor integer
+
+  note: '''
+  ## Currency Reference (`_mw`) — MacroDB Subscription
+
+  Read-only ISO 4217 currency reference. Populated via logical replication
+  subscription `macrodb_currency_reference` from publication `macrodb_currency_table`
+  on the MacroDB reference database. `INSERT / UPDATE / DELETE` are revoked from
+  `PUBLIC`. All incoming foreign-key constraints are omitted on the subscriber side.
+
+  ### Referenced By
+
+  - **`common.account_mw`** — `fk_account_base_currency` (account denomination)
+  '''
+}
+
+table common.securities_mw {
+  security_isin_code   char(12)     [pk] // pk_security_isin_code
+  security_description varchar(255) [not null]
+  security_issuer_name varchar(255)
+  security_issuer_type varchar(64) // enum: stocksdb common.security_issue_type
+  isin_data_source_id  char(5)      [not null]
+
+  indexes {
+    security_issuer_type [name: 'ix_securities_mw_security_issuer_type']
+  }
+
+  note: '''
+  ## Securities Reference (`_mw`) — StocksDB Subscription
+
+  Read-only ISIN-keyed securities master. Populated via logical replication
+  subscription `stocksdb_securities_reference` from publication
+  `stocksdb_securities_table` on the StocksDB operational database. `INSERT /
+  UPDATE / DELETE` are revoked from `PUBLIC`; incoming foreign keys are omitted.
+
+  Mirrors the source column shape exactly. `isin_data_source_id` is retained as a
+  plain column (the `public.data_source_mw` it points to lives in StocksDB and is
+  *not* subscribed here).
+
+  ### Referenced By
+
+  - **`common.securities_exchange_symbol_mw`** — logical reference (no FK — both are subscription tables)
+  - **`private.position_snapshot_tx`** / tax lots — by ISIN (delivery aggregation)
+  '''
+}
+
+table common.securities_exchange_symbol_mw {
+  ses_primary_id         integer      [pk] // pk_securities_exchange_symbol_id (replicated value — not locally generated)
+  security_isin_code     char(12)     [not null]
+  market_identifier_code char(4)      [not null]
+  exchange_symbol        varchar(32)  [not null]
+  exchange_symbol_name   varchar(255) [not null]
+  symbol_series_code     varchar(16)
+  ses_data_source_id     char(5)      [not null]
+  created_on             timestamptz  [not null]
+
+  indexes {
+    market_identifier_code [name: 'ix_ses_mw_market_identifier_code']
+    symbol_series_code     [name: 'ix_ses_mw_symbol_series_code']
+    exchange_symbol        [name: 'ix_ses_mw_exchange_symbol']
+    (security_isin_code, market_identifier_code, exchange_symbol, exchange_symbol_name) [unique, name: 'uq_exchange_symbol']
+  }
+
+  note: '''
+  ## Securities Exchange Symbol Reference (`_mw`) — StocksDB Subscription
+
+  Read-only ISIN → exchange-symbol bridge. Populated via subscription
+  `stocksdb_securities_reference` from publication `stocksdb_securities_table`.
+  `INSERT / UPDATE / DELETE` are revoked from `PUBLIC`; incoming foreign keys are
+  omitted.
+
+  > **Note:** `ses_primary_id` is the equity trading grain of the whole platform —
+  > it is the value persisted on signals, orders, positions and the StocksDB price
+  > time-series. Locally it is a plain `integer` primary key (the identity sequence
+  > lives on the publisher); it is **not** `generated ... as identity` here.
+
+  ### Referenced By
+
+  - **`common.strategy_universe_mw`** — `fk_universe_ses_primary_id` (equity leg)
+  - **`private.signal_tx`** — `fk_signal_ses_primary_id`
+  - **`private.order_tx`** — `fk_order_ses_primary_id`
+  - **`private.position_snapshot_tx`** — `fk_position_ses_primary_id`
+  '''
+}
+
+table common.stock_exchange_mw {
+  market_identifier_code    char(4)     [pk] // pk_market_identifier_code
+  operating_mic_code        char(4)     [not null]
+  legal_exchange_name       varchar(64) [not null]
+  scock_exchange_acronym    varchar(16) // preserved typo — matches live StocksDB schema
+  stock_exchange_country_id char(3)     [not null]
+  registered_city_code      char(5)
+  trading_currency_code     char(3)     [not null]
+  operational_from          date        [not null]
+  operational_to            date
+  data_source_id            char(5)     [not null]
+
+  indexes {
+    (stock_exchange_country_id, legal_exchange_name) [unique, name: 'uq_stock_exchange_name']
+  }
+
+  note: '''
+  ## Stock Exchange Reference (`_mw`) — StocksDB Subscription
+
+  Read-only ISO 10383 MIC-coded exchange master. Populated via subscription
+  `stocksdb_exchange_reference` from publication `stocksdb_exchange_table`. `INSERT /
+  UPDATE / DELETE` are revoked from `PUBLIC`; incoming foreign keys are omitted.
+
+  `stock_exchange_country_id`, `registered_city_code` and `trading_currency_code`
+  are retained as plain columns (their parents — country / city / currency — are not
+  all subscribed into `tradesdb`, and subscriber-side FKs are dropped regardless).
+  The `scock_exchange_acronym` typo is preserved to match the live source schema.
+
+  ### Referenced By
+
+  - Resolved through `ses_primary_id` / `derivative_contract_id`; no direct FK from trading facts.
+  '''
+}
+
+table common.derivative_contract_mw {
+  derivative_contract_id  bigint        [pk] // pk_derivative_contract_id (replicated value — not locally generated)
+  underlying_type         varchar       [not null] // enum: stocksdb common.underlying_type
+  underlying_isin         char(12)
+  underlying_index_id     integer
+  instrument_type         varchar       [not null] // enum: stocksdb common.derivative_instrument_type
+  option_type             varchar // enum: stocksdb common.option_type · NULL for futures
+  strike_price            numeric(21,5) // NULL for futures
+  expiry_date             date          [not null]
+  market_identifier_code  char(4)       [not null]
+  tradable_symbol         varchar(64)   [not null]
+  lot_size                integer
+  tick_size               numeric(21,5)
+  contract_data_source_id char(5)       [not null]
+  created_on              timestamptz   [not null]
+
+  indexes {
+    (market_identifier_code, instrument_type, underlying_type, underlying_isin, underlying_index_id, expiry_date, option_type, strike_price) [unique, name: 'uq_derivative_contract']
+  }
+
+  note: '''
+  ## Derivative Contract Reference (`_mw`) — StocksDB Subscription
+
+  Read-only option/future contract master. Populated via subscription
+  `stocksdb_derivative_reference` from publication `stocksdb_derivative_table`.
+  `INSERT / UPDATE / DELETE` are revoked from `PUBLIC`; incoming foreign keys are
+  omitted. Mirrors the source column shape (polymorphic underlying, option-only
+  fields nullable). Out of scope for the cash-equity v1 phase but subscribed from
+  day one so the polymorphic instrument reference on trading facts resolves once
+  F&O is enabled.
+
+  > **Note:** `derivative_contract_id` is a plain `bigint` primary key here (the
+  > identity sequence lives on the publisher).
+
+  ### Referenced By
+
+  - **`common.strategy_universe_mw`** — `fk_universe_derivative_contract_id` (derivative leg)
+  - **`private.signal_tx`** — `fk_signal_derivative_contract_id`
+  - **`private.order_tx`** — `fk_order_derivative_contract_id`
+  - **`private.position_snapshot_tx`** — `fk_position_derivative_contract_id`
+  '''
+}
+
+
+// ============================================================================
+// common schema — trading masters (locally owned · read-write)
+// ============================================================================
+
+table common.account_mw {
+  account_uuid       uuid          [pk, default: `gen_random_uuid()`] // pk_account_uuid
+  broker_code        char(5)       [not null, ref: > public.broker_mw.broker_code] // fk_account_broker_code · on update cascade · on delete restrict
+  account_label      varchar(64)   [not null, unique] // uq_account_label
+  broker_client_id   varchar(32)   [not null]
+  base_currency_code char(3)       [not null, ref: > common.currency_mw.currency_code] // fk_account_base_currency · on update cascade · on delete restrict
+  allocated_capital  numeric(21,5) [not null]
+  is_active          boolean       [not null, default: true]
+  created_on         timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (broker_code, broker_client_id) [unique, name: 'uq_account_broker_client']
+  }
+
+  note: '''
+  ## Account Master (`mw` = Master-World)
+
+  Normalised registry of trading (DEMAT) accounts. The `account_uuid` surrogate is
+  the partition key threaded through **every** transactional fact in `private`,
+  isolating multi-account books cleanly from day one (single account today, more
+  later — no migration needed). `broker_client_id` is the broker-side identifier
+  (not a secret); credentials live in the host secret store.
+
+  `allocated_capital` is the total deployable capital for the account; per-strategy
+  slices are governed by `common.strategy_allocation_mw`.
+
+  ### Parents
+
+  - **`public.broker_mw`** — `fk_account_broker_code`
+  - **`common.currency_mw`** — `fk_account_base_currency`
+
+  ### Composite Unique Constraints
+
+  - `uq_account_broker_client`: (`broker_code`, `broker_client_id`) — one row per
+    client id per broker.
+
+  ### Referenced By
+
+  - Every `private.*_tx` table via `account_uuid`; `common.strategy_allocation_mw`;
+    `common.risk_rule_mw`.
+  '''
+}
+
+table common.strategy_mw {
+  strategy_uuid    uuid         [pk, default: `gen_random_uuid()`] // pk_strategy_uuid
+  strategy_name    varchar(64)  [not null]
+  strategy_version varchar(16)  [not null] // content hash of the parameter set
+  strategy_stage   varchar(8)   [not null, default: 'A'] // enum: common.strategy_stage (A, B, C, RETIRED)
+  signal_source    varchar(16)  [not null, default: 'STRATEGY'] // enum: common.signal_source
+  timeframe        varchar      [not null] // enum: common.timeframe_value
+  instrument_kind  varchar(16)  [not null] // enum: private.instrument_kind (EQUITY, DERIVATIVE)
+  entry_point      varchar(128) [not null] // python import path, e.g. algotraders.strategies.opening_range
+  is_active        boolean      [not null, default: true]
+  created_on       timestamptz  [not null, default: `now()`]
+
+  indexes {
+    (strategy_name, strategy_version) [unique, name: 'uq_strategy_name_version']
+    (strategy_stage, is_active)       [name: 'ix_strategy_mw_stage_active']
+  }
+
+  note: '''
+  ## Strategy Master (`mw` = Master-World)
+
+  Definition registry of trading strategies, mirroring the decorator-registry
+  pattern used for brokers in `algotraders`. Each row pins a strategy *name* to a
+  content-hashed *version* of its parameter set, so every signal, order and backtest
+  result traces back to an exact parameterisation.
+
+  - `strategy_stage` drives the automation lifecycle: `A` (signal-only) → `B`
+    (human-approved) → `C` (fully automated) → `RETIRED`. Stage promotion is an
+    audit-logged action (`STAGE_PROMOTED`).
+  - `signal_source` distinguishes native Python strategies (`STRATEGY`) from
+    TradingView-webhook (`TRADINGVIEW`) and discretionary (`MANUAL`) sources.
+  - `entry_point` is the importable Python path the live/paper/backtest engines load.
+
+  ### Composite Unique Constraints
+
+  - `uq_strategy_name_version`: (`strategy_name`, `strategy_version`).
+
+  ### Referenced By
+
+  - **`common.strategy_allocation_mw`** — `fk_allocation_strategy_uuid`
+  - **`common.strategy_universe_mw`** — `fk_universe_strategy_uuid`
+  - **`common.risk_rule_mw`** — `fk_risk_rule_strategy_uuid` (nullable)
+  - **`private.signal_tx`** / **`order_tx`** / **`position_snapshot_tx`** / **`pnl_daily_tx`** (nullable)
+  '''
+}
+
+table common.strategy_allocation_mw {
+  allocation_id     integer       [pk, increment] // pk_allocation_id · generated always as identity
+  account_uuid      uuid          [not null, ref: > common.account_mw.account_uuid] // fk_allocation_account_uuid · on update cascade · on delete restrict
+  strategy_uuid     uuid          [not null, ref: > common.strategy_mw.strategy_uuid] // fk_allocation_strategy_uuid · on update cascade · on delete restrict
+  allocation_policy varchar(24)   [not null] // enum: common.allocation_policy (STATIC_PCT, DYNAMIC_FREEFLOAT)
+  allocation_pct    numeric(5, 2) // % of account capital · used when policy = STATIC_PCT
+  max_capital       numeric(21,5) // hard ceiling regardless of policy
+  is_active         boolean       [not null, default: true]
+  created_on        timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (account_uuid, strategy_uuid) [unique, name: 'uq_strategy_allocation']
+  }
+
+  note: '''
+  ## Strategy Capital Allocation (`mw` = Master-World)
+
+  Normalised junction binding a strategy to an account with its capital mandate.
+  Splitting allocation out of `strategy_mw` lets the same strategy definition run on
+  multiple accounts with different sizing.
+
+  - `STATIC_PCT` — strategy is capped at `allocation_pct` of the account's
+    `allocated_capital`.
+  - `DYNAMIC_FREEFLOAT` — strategy draws from unutilised account margin, bounded by
+    `max_capital`.
+
+  ### Parents
+
+  - **`common.account_mw`** — `fk_allocation_account_uuid`
+  - **`common.strategy_mw`** — `fk_allocation_strategy_uuid`
+
+  ### Composite Unique Constraints
+
+  - `uq_strategy_allocation`: (`account_uuid`, `strategy_uuid`) — one mandate per
+    strategy per account.
+
+  ### Check Constraint
+
+  - `ck_allocation_policy_fields` — `STATIC_PCT` requires a positive `allocation_pct`
+    in `(0, 100]`; `DYNAMIC_FREEFLOAT` requires `max_capital` to be set.
+  '''
+}
+
+table common.strategy_universe_mw {
+  universe_id            integer [pk, increment] // pk_universe_id · generated always as identity
+  strategy_uuid          uuid    [not null, ref: > common.strategy_mw.strategy_uuid] // fk_universe_strategy_uuid · on update cascade · on delete restrict
+  instrument_kind        varchar(16) [not null] // enum: private.instrument_kind
+  ses_primary_id         integer [ref: > common.securities_exchange_symbol_mw.ses_primary_id] // fk_universe_ses_primary_id · nullable · on update cascade · on delete restrict
+  derivative_contract_id bigint  [ref: > common.derivative_contract_mw.derivative_contract_id] // fk_universe_derivative_contract_id · nullable · on update cascade · on delete restrict
+  is_active              boolean [not null, default: true]
+  created_on             timestamptz [not null, default: `now()`]
+
+  indexes {
+    (strategy_uuid, ses_primary_id, derivative_contract_id) [unique, name: 'uq_strategy_universe'] // composite (NULLS NOT DISTINCT): one instrument per strategy
+  }
+
+  note: '''
+  ## Strategy Instrument Universe (`mw` = Master-World)
+
+  The set of instruments a strategy is permitted to trade / subscribe to. The live
+  engine uses this to drive dynamic tick subscriptions on the ticker service. The
+  underlying is polymorphic — exactly one of `ses_primary_id` (equity) or
+  `derivative_contract_id` (derivative) is populated, matching `instrument_kind`.
+
+  ### Parents
+
+  - **`common.strategy_mw`** — `fk_universe_strategy_uuid`
+  - **`common.securities_exchange_symbol_mw`** — `fk_universe_ses_primary_id` (nullable)
+  - **`common.derivative_contract_mw`** — `fk_universe_derivative_contract_id` (nullable)
+
+  ### Check Constraint
+
+  - `ck_universe_instrument_xor` — exactly one instrument ref set, matching
+    `instrument_kind` (`EQUITY` ⇒ `ses_primary_id`; `DERIVATIVE` ⇒
+    `derivative_contract_id`).
+
+  ### Composite Unique Constraints
+
+  - `uq_strategy_universe` (`UNIQUE NULLS NOT DISTINCT`): (`strategy_uuid`,
+    `ses_primary_id`, `derivative_contract_id`).
+  '''
+}
+
+table common.risk_rule_mw {
+  risk_rule_id   integer       [pk, increment] // pk_risk_rule_id · generated always as identity
+  risk_scope     varchar(16)   [not null] // enum: common.risk_scope (ACCOUNT, STRATEGY, PORTFOLIO)
+  account_uuid   uuid          [ref: > common.account_mw.account_uuid] // fk_risk_rule_account_uuid · nullable · on update cascade · on delete restrict
+  strategy_uuid  uuid          [ref: > common.strategy_mw.strategy_uuid] // fk_risk_rule_strategy_uuid · nullable · on update cascade · on delete restrict
+  risk_rule_type varchar(32)   [not null] // enum: common.risk_rule_type
+  threshold_value numeric(21,5) [not null]
+  threshold_unit varchar(16)   [not null] // PCT · ABS · COUNT
+  is_active      boolean       [not null, default: true]
+  created_on     timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (risk_scope, is_active) [name: 'ix_risk_rule_mw_scope_active']
+    (account_uuid, strategy_uuid, risk_rule_type) [unique, name: 'uq_risk_rule'] // composite (NULLS NOT DISTINCT): one rule of a type per scope target
+  }
+
+  note: '''
+  ## Risk Rule Master (`mw` = Master-World)
+
+  Config-driven risk limits enforced by the risk manager *before* any order reaches
+  the OMS — no code redeploy needed to change a limit. A rule is scoped to an
+  account, a strategy, or the whole portfolio (`risk_scope`), and the relevant
+  `account_uuid` / `strategy_uuid` is populated accordingly (both null ⇒
+  `PORTFOLIO`).
+
+  Covers your stated controls: per-trade stop-loss (`PER_TRADE_SL`), position sizing
+  (`POSITION_SIZE`), daily max-loss circuit breaker (`DAILY_MAX_LOSS`), max
+  concurrent positions (`MAX_POSITIONS`), single-ISIN exposure cap
+  (`SINGLE_ISIN_EXPOSURE`), and sector concentration (`SECTOR_CONC`).
+
+  ### Parents
+
+  - **`common.account_mw`** — `fk_risk_rule_account_uuid` (nullable)
+  - **`common.strategy_mw`** — `fk_risk_rule_strategy_uuid` (nullable)
+
+  ### Composite Unique Constraints
+
+  - `uq_risk_rule` (`UNIQUE NULLS NOT DISTINCT`): (`account_uuid`, `strategy_uuid`,
+    `risk_rule_type`).
+
+  ### Referenced By
+
+  - **`private.circuit_breaker_tx`** — `fk_circuit_risk_rule_id`
+  '''
+}
+
+
+// ============================================================================
+// private schema — transactional facts (signals → orders → fills → positions)
+// ============================================================================
+
+table private.signal_tx {
+  signal_uuid            uuid          [pk, default: `gen_random_uuid()`] // pk_signal_uuid
+  account_uuid           uuid          [not null, ref: > common.account_mw.account_uuid] // fk_signal_account_uuid · on update cascade · on delete restrict
+  strategy_uuid          uuid          [ref: > common.strategy_mw.strategy_uuid] // fk_signal_strategy_uuid · nullable (manual / tradingview) · on update cascade · on delete restrict
+  signal_source          varchar(16)   [not null] // enum: common.signal_source
+  signal_action          varchar(16)   [not null] // enum: private.signal_action
+  instrument_kind        varchar(16)   [not null] // enum: private.instrument_kind
+  ses_primary_id         integer       [ref: > common.securities_exchange_symbol_mw.ses_primary_id] // fk_signal_ses_primary_id · nullable · on update cascade · on delete restrict
+  derivative_contract_id bigint        [ref: > common.derivative_contract_mw.derivative_contract_id] // fk_signal_derivative_contract_id · nullable · on update cascade · on delete restrict
+  target_price           numeric(21,5)
+  stop_loss_price        numeric(21,5)
+  suggested_quantity     integer
+  signal_status          varchar(24)   [not null, default: 'PENDING'] // enum: private.signal_status
+  execution_mode         varchar(12)   [not null] // enum: private.execution_mode
+  generated_at           timestamptz   [not null]
+  valid_until            timestamptz
+  payload                jsonb
+  created_on             timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (account_uuid, signal_status) [name: 'ix_signal_tx_account_status']
+    (strategy_uuid, generated_at) [name: 'ix_signal_tx_strategy_generated']
+    (strategy_uuid, ses_primary_id, derivative_contract_id, generated_at, execution_mode) [unique, name: 'uq_signal'] // composite (NULLS NOT DISTINCT): dedupe identical signals
+  }
+
+  note: '''
+  ## Signal Transactions (`tx` = Transactional)
+
+  Every trade idea emitted by a strategy, a TradingView webhook, or a manual entry.
+  The `signal_uuid` is the **end-to-end trace id**: it threads through `order_tx`,
+  `audit_log_tx`, structured logs and Prometheus traces, letting one signal be
+  followed across every service.
+
+  Lifecycle: `PENDING` → `VALIDATED` (passed risk) → `APPROVED` (B-stage human gate)
+  → routed to OMS; or `REJECTED` / `EXPIRED`. `valid_until` drives auto-expiry of
+  stale approvals (60s intraday / 5min swing, configurable per strategy).
+  `payload` (jsonb) carries strategy-specific context for audit and replay.
+
+  ### Parents
+
+  - **`common.account_mw`** — `fk_signal_account_uuid`
+  - **`common.strategy_mw`** — `fk_signal_strategy_uuid` (nullable)
+  - **`common.securities_exchange_symbol_mw`** — `fk_signal_ses_primary_id` (nullable)
+  - **`common.derivative_contract_mw`** — `fk_signal_derivative_contract_id` (nullable)
+
+  ### Check Constraint
+
+  - `ck_signal_instrument_xor` — exactly one instrument ref set, matching `instrument_kind`.
+
+  ### Composite Unique Constraints
+
+  - `uq_signal` (`UNIQUE NULLS NOT DISTINCT`): (`strategy_uuid`, `ses_primary_id`,
+    `derivative_contract_id`, `generated_at`, `execution_mode`).
+
+  ### Referenced By
+
+  - **`private.order_tx`** — `fk_order_signal_uuid` (nullable — manual orders carry none)
+  '''
+}
+
+table private.order_tx {
+  order_uuid             uuid          [pk, default: `gen_random_uuid()`] // pk_order_uuid (client-side idempotency key)
+  signal_uuid            uuid          [ref: > private.signal_tx.signal_uuid] // fk_order_signal_uuid · nullable · on update cascade · on delete restrict
+  account_uuid           uuid          [not null, ref: > common.account_mw.account_uuid] // fk_order_account_uuid · on update cascade · on delete restrict
+  strategy_uuid          uuid          [ref: > common.strategy_mw.strategy_uuid] // fk_order_strategy_uuid · nullable · on update cascade · on delete restrict
+  broker_code            char(5)       [not null, ref: > public.broker_mw.broker_code] // fk_order_broker_code · on update cascade · on delete restrict
+  instrument_kind        varchar(16)   [not null] // enum: private.instrument_kind
+  ses_primary_id         integer       [ref: > common.securities_exchange_symbol_mw.ses_primary_id] // fk_order_ses_primary_id · nullable · on update cascade · on delete restrict
+  derivative_contract_id bigint        [ref: > common.derivative_contract_mw.derivative_contract_id] // fk_order_derivative_contract_id · nullable · on update cascade · on delete restrict
+  order_side             varchar(8)    [not null] // enum: private.order_side
+  order_type             varchar(8)    [not null] // enum: private.order_type
+  order_variety          varchar(12)   [not null, default: 'REGULAR'] // enum: private.order_variety
+  product_type           varchar(12)   [not null] // enum: private.product_type
+  quantity               integer       [not null]
+  limit_price            numeric(21,5) // NULL for MARKET
+  trigger_price          numeric(21,5) // SL / SL_M only
+  order_status           varchar(24)   [not null, default: 'PENDING_APPROVAL'] // enum: private.order_status
+  broker_order_id        varchar(64) // assigned by broker on submit
+  approval_source        varchar(16) // enum: private.approval_source · nullable
+  approved_at            timestamptz
+  execution_mode         varchar(12)   [not null] // enum: private.execution_mode
+  placed_at              timestamptz
+  created_on             timestamptz   [not null, default: `now()`]
+  updated_on             timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (broker_code, broker_order_id) [unique, name: 'uq_broker_order_id'] // partial: WHERE broker_order_id IS NOT NULL
+    (account_uuid, order_status)   [name: 'ix_order_tx_account_status']
+    signal_uuid                    [name: 'ix_order_tx_signal_uuid']
+  }
+
+  note: '''
+  ## Order Transactions (`tx` = Transactional)
+
+  The order lifecycle, one row per order. `order_uuid` is a **client-generated
+  idempotency key** — the OMS persists the order *before* sending to the broker, so
+  a crash-restart never double-submits; the broker's `broker_order_id` is linked on
+  response. Manual orders carry a `NULL` `signal_uuid`.
+
+  `order_variety` defaults to `REGULAR`; `BRACKET` / `COVER` / `AMO` slot in later
+  with no schema change (their extra legs / state are modelled when F&O / advanced
+  orders are enabled). For cash-equity v1, `product_type` is typically `CNC`
+  (delivery) or `INTRADAY` (MIS).
+
+  ### Parents
+
+  - **`private.signal_tx`** — `fk_order_signal_uuid` (nullable)
+  - **`common.account_mw`** — `fk_order_account_uuid`
+  - **`common.strategy_mw`** — `fk_order_strategy_uuid` (nullable)
+  - **`public.broker_mw`** — `fk_order_broker_code`
+  - **`common.securities_exchange_symbol_mw`** — `fk_order_ses_primary_id` (nullable)
+  - **`common.derivative_contract_mw`** — `fk_order_derivative_contract_id` (nullable)
+
+  ### Check Constraints
+
+  - `ck_order_instrument_xor` — exactly one instrument ref set, matching `instrument_kind`.
+  - `ck_order_price_fields` — `LIMIT` ⇒ `limit_price` set; `SL` / `SL_M` ⇒
+    `trigger_price` set; `MARKET` ⇒ both null.
+  - `ck_order_quantity` — `quantity` > 0.
+
+  ### Composite Unique Constraints
+
+  - `uq_broker_order_id` (partial, `WHERE broker_order_id IS NOT NULL`):
+    (`broker_code`, `broker_order_id`).
+
+  ### Referenced By
+
+  - **`private.execution_tx`** — `fk_execution_order_uuid`
+  '''
+}
+
+table private.execution_tx {
+  execution_id        bigint        [pk, increment] // pk_execution_id · generated always as identity
+  order_uuid          uuid          [not null, ref: > private.order_tx.order_uuid] // fk_execution_order_uuid · on update cascade · on delete restrict
+  account_uuid        uuid          [not null, ref: > common.account_mw.account_uuid] // fk_execution_account_uuid · on update cascade · on delete restrict
+  broker_execution_id varchar(64)   [not null]
+  filled_quantity     integer       [not null]
+  fill_price          numeric(21,5) [not null]
+  brokerage           numeric(21,5) [not null, default: 0]
+  taxes_and_charges   numeric(21,5) [not null, default: 0]
+  net_amount          numeric(21,5) [not null] // signed cashflow (− on buy, + on sell, net of charges)
+  execution_mode      varchar(12)   [not null] // enum: private.execution_mode
+  fill_time           timestamptz   [not null]
+  created_on          timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (order_uuid, broker_execution_id) [unique, name: 'uq_execution']
+    (account_uuid, fill_time)         [name: 'ix_execution_tx_account_fill_time']
+    fill_time                         [name: 'ix_execution_tx_fill_time']
+  }
+
+  note: '''
+  ## Execution (Fill) Transactions (`tx` = Transactional)
+
+  One row per fill — a single order may produce several (partial fills). The
+  `(order_uuid, broker_execution_id)` uniqueness makes fill ingestion idempotent
+  under broker WebSocket replays. `brokerage` and `taxes_and_charges` are captured at
+  fill time for accurate net P&L; the granular charge breakup (STT, exchange txn,
+  GST, SEBI, stamp duty) used for ITR reporting lives in the deferred `tax` schema.
+
+  ### Parents
+
+  - **`private.order_tx`** — `fk_execution_order_uuid`
+  - **`common.account_mw`** — `fk_execution_account_uuid`
+
+  ### Check Constraints
+
+  - `ck_execution_quantity` — `filled_quantity` > 0.
+  - `ck_execution_price` — `fill_price` ≥ 0; `brokerage` ≥ 0; `taxes_and_charges` ≥ 0.
+
+  ### Composite Unique Constraints
+
+  - `uq_execution`: (`order_uuid`, `broker_execution_id`).
+  '''
+}
+
+table private.position_snapshot_tx {
+  position_snapshot_id   bigint        [pk, increment] // pk_position_snapshot_id · generated always as identity
+  account_uuid           uuid          [not null, ref: > common.account_mw.account_uuid] // fk_position_account_uuid · on update cascade · on delete restrict
+  strategy_uuid          uuid          [ref: > common.strategy_mw.strategy_uuid] // fk_position_strategy_uuid · nullable · on update cascade · on delete restrict
+  instrument_kind        varchar(16)   [not null] // enum: private.instrument_kind
+  ses_primary_id         integer       [ref: > common.securities_exchange_symbol_mw.ses_primary_id] // fk_position_ses_primary_id · nullable · on update cascade · on delete restrict
+  derivative_contract_id bigint        [ref: > common.derivative_contract_mw.derivative_contract_id] // fk_position_derivative_contract_id · nullable · on update cascade · on delete restrict
+  net_quantity           integer       [not null]
+  average_price          numeric(21,5) [not null]
+  last_traded_price      numeric(21,5)
+  realized_pnl           numeric(21,5) [not null, default: 0]
+  unrealized_pnl         numeric(21,5) [not null, default: 0]
+  execution_mode         varchar(12)   [not null] // enum: private.execution_mode
+  snapshot_time          timestamptz   [not null]
+  created_on             timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (account_uuid, strategy_uuid, ses_primary_id, derivative_contract_id, snapshot_time, execution_mode) [unique, name: 'uq_position_snapshot'] // composite (NULLS NOT DISTINCT): one snapshot per book per instant
+    (account_uuid, snapshot_time) [name: 'ix_position_snapshot_tx_account_time']
+  }
+
+  note: '''
+  ## Position Snapshot Transactions (`tx` = Transactional)
+
+  Periodic and event-driven snapshots of the live book, attributed to a strategy
+  where known (nullable for account-level / manual positions). Drives the dashboard
+  positions view and feeds the risk manager's exposure and concentration checks. The
+  underlying is polymorphic — equity (`ses_primary_id`) or derivative
+  (`derivative_contract_id`).
+
+  ### Parents
+
+  - **`common.account_mw`** — `fk_position_account_uuid`
+  - **`common.strategy_mw`** — `fk_position_strategy_uuid` (nullable)
+  - **`common.securities_exchange_symbol_mw`** — `fk_position_ses_primary_id` (nullable)
+  - **`common.derivative_contract_mw`** — `fk_position_derivative_contract_id` (nullable)
+
+  ### Check Constraint
+
+  - `ck_position_instrument_xor` — exactly one instrument ref set, matching `instrument_kind`.
+
+  ### Composite Unique Constraints
+
+  - `uq_position_snapshot` (`UNIQUE NULLS NOT DISTINCT`): (`account_uuid`,
+    `strategy_uuid`, `ses_primary_id`, `derivative_contract_id`, `snapshot_time`,
+    `execution_mode`).
+  '''
+}
+
+table private.pnl_daily_tx {
+  pnl_id          bigint        [pk, increment] // pk_pnl_id · generated always as identity
+  pnl_date        date          [not null]
+  account_uuid    uuid          [not null, ref: > common.account_mw.account_uuid] // fk_pnl_account_uuid · on update cascade · on delete restrict
+  strategy_uuid   uuid          [ref: > common.strategy_mw.strategy_uuid] // fk_pnl_strategy_uuid · nullable (NULL = account-level aggregate) · on update cascade · on delete restrict
+  gross_pnl       numeric(21,5) [not null]
+  total_charges   numeric(21,5) [not null, default: 0]
+  net_pnl         numeric(21,5) [not null]
+  realized_pnl    numeric(21,5) [not null, default: 0]
+  unrealized_pnl  numeric(21,5) [not null, default: 0]
+  trade_count     integer       [not null, default: 0]
+  execution_mode  varchar(12)   [not null] // enum: private.execution_mode
+  created_on      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (pnl_date, account_uuid, strategy_uuid, execution_mode) [unique, name: 'uq_pnl_daily'] // composite (NULLS NOT DISTINCT): one row per book per day per mode
+    (account_uuid, pnl_date) [name: 'ix_pnl_daily_tx_account_date']
+  }
+
+  note: '''
+  ## Daily P&L Transactions (`tx` = Transactional)
+
+  End-of-day P&L roll-up per account per strategy (a `NULL` `strategy_uuid` row is
+  the account-level aggregate). Powers the dashboard P&L charts and the daily-loss
+  circuit-breaker baseline. `execution_mode` keeps live, paper and backtest books on
+  separate rows so shadow-trading comparisons are a single query.
+
+  ### Parents
+
+  - **`common.account_mw`** — `fk_pnl_account_uuid`
+  - **`common.strategy_mw`** — `fk_pnl_strategy_uuid` (nullable)
+
+  ### Composite Unique Constraints
+
+  - `uq_pnl_daily` (`UNIQUE NULLS NOT DISTINCT`): (`pnl_date`, `account_uuid`,
+    `strategy_uuid`, `execution_mode`).
+  '''
+}
+
+table private.circuit_breaker_tx {
+  circuit_event_id bigint        [pk, increment] // pk_circuit_event_id · generated always as identity
+  account_uuid     uuid          [not null, ref: > common.account_mw.account_uuid] // fk_circuit_account_uuid · on update cascade · on delete restrict
+  strategy_uuid    uuid          [ref: > common.strategy_mw.strategy_uuid] // fk_circuit_strategy_uuid · nullable · on update cascade · on delete restrict
+  risk_rule_id     integer       [not null, ref: > common.risk_rule_mw.risk_rule_id] // fk_circuit_risk_rule_id · on update cascade · on delete restrict
+  circuit_scope    varchar(16)   [not null] // enum: common.risk_scope
+  threshold_value  numeric(21,5) [not null]
+  observed_value   numeric(21,5) [not null]
+  tripped_at       timestamptz   [not null]
+  reset_at         timestamptz
+  is_active        boolean       [not null, default: true]
+  created_on       timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (account_uuid, is_active) [name: 'ix_circuit_tx_account_active']
+    tripped_at                [name: 'ix_circuit_tx_tripped_at']
+  }
+
+  note: '''
+  ## Circuit Breaker Transactions (`tx` = Transactional)
+
+  Audit of every circuit-breaker trip — the rule that fired, the threshold, the
+  observed value, and when it reset. Trip state is mirrored in Redis for hot reads;
+  this table is the durable record. A trip fans out to Telegram and the dashboard.
+  Daily-loss breakers reset at the 09:00 IST pre-open; manual override requires the
+  kill-switch and an explicit restart flag (logged as `CIRCUIT_OVERRIDE`).
+
+  ### Parents
+
+  - **`common.account_mw`** — `fk_circuit_account_uuid`
+  - **`common.strategy_mw`** — `fk_circuit_strategy_uuid` (nullable)
+  - **`common.risk_rule_mw`** — `fk_circuit_risk_rule_id`
+  '''
+}
+
+table private.audit_log_tx {
+  audit_id     bigint      [pk, increment] // pk_audit_id · generated always as identity
+  account_uuid uuid        [ref: > common.account_mw.account_uuid] // fk_audit_account_uuid · nullable (system events) · on update cascade · on delete restrict
+  actor_type   varchar(16) [not null] // enum: private.actor_type (SYSTEM, STRATEGY, USER, BROKER)
+  actor_id     varchar(64)
+  audit_action varchar(48) [not null] // SIGNAL_GENERATED, ORDER_PLACED, ORDER_APPROVED, CIRCUIT_TRIPPED, STAGE_PROMOTED, ...
+  entity_type  varchar(32) [not null] // SIGNAL, ORDER, EXECUTION, STRATEGY, RISK_RULE, ACCOUNT
+  entity_id    varchar(64) [not null] // uuid / id rendered as text
+  signal_uuid  uuid // logical reference · no FK (orphaned / failed entities must still log)
+  order_uuid   uuid // logical reference · no FK
+  payload      jsonb
+  logged_at    timestamptz [not null, default: `now()`]
+
+  indexes {
+    (entity_type, entity_id) [name: 'ix_audit_tx_entity']
+    audit_action             [name: 'ix_audit_tx_action']
+    logged_at                [name: 'ix_audit_tx_logged_at']
+    order_uuid               [name: 'ix_audit_tx_order_uuid']
+    signal_uuid              [name: 'ix_audit_tx_signal_uuid']
+  }
+
+  note: '''
+  ## Audit Log (`tx` = Transactional) — 🔒 **Immutable**
+
+  Append-only record of every consequential action: who (`actor_type` / `actor_id`)
+  did what (`audit_action`) to which entity (`entity_type` / `entity_id`), with full
+  context in `payload`. The cross-service trace ids (`signal_uuid`, `order_uuid`) are
+  stored as **logical references with no FK** — a failed or rejected entity that
+  never persisted elsewhere must still be auditable.
+
+  > **Immutability:** `UPDATE` and `DELETE` are revoked from **all** roles; only
+  > `INSERT` and `SELECT` are granted. Enforced further by a `BEFORE UPDATE OR
+  > DELETE` trigger that raises. This is the regulatory-grade record of which order
+  > was placed by which strategy, when, and on whose approval.
+
+  ### Parents
+
+  - **`common.account_mw`** — `fk_audit_account_uuid` (nullable — system-level events carry none)
+
+  ### Accessor & Audit Functions (`dev` schema — no tables)
+
+  | function                              | purpose                                                          |
+  |:--------------------------------------|:-----------------------------------------------------------------|
+  | `dev.audit_trail_for_order_udf`       | Full ordered event trail for an `order_uuid`.                    |
+  | `dev.audit_trail_for_signal_udf`      | Full ordered event trail for a `signal_uuid` (signal → fills).   |
+  | `dev.open_positions_udf`              | Latest non-zero position per book from `position_snapshot_tx`.   |
+  | `dev.realized_pnl_for_range_udf`      | Realized P&L for an account / strategy over a date range.        |
+  | `dev.missing_pnl_dates_udf`           | Audit — trading dates with executions but no `pnl_daily_tx` row. |
+  '''
+}
+
+
+// ============================================================================
+// logical grouping — drives layout in dbdiagram.io
+// ============================================================================
+
+tablegroup bootstrap {
+  public.broker_mw
+}
+
+tablegroup subscribed_reference {
+  common.currency_mw
+  common.securities_mw
+  common.securities_exchange_symbol_mw
+  common.stock_exchange_mw
+  common.derivative_contract_mw
+}
+
+tablegroup trading_masters {
+  common.account_mw
+  common.strategy_mw
+  common.strategy_allocation_mw
+  common.strategy_universe_mw
+  common.risk_rule_mw
+}
+
+tablegroup trading_facts {
+  private.signal_tx
+  private.order_tx
+  private.execution_tx
+  private.position_snapshot_tx
+  private.pnl_daily_tx
+}
+
+tablegroup risk_and_audit {
+  private.circuit_breaker_tx
+  private.audit_log_tx
+}
